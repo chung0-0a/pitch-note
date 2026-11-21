@@ -16,7 +16,7 @@ public class MainActivity extends Activity {
   final String[] NOTES={"도","도♯","레","레♯","미","파","파♯","솔","솔♯","라","라♯","시"};
   final String[] EN={"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
   LinearLayout root; TextView target, current, difference, status, micButton; PitchGraph graph; Keyboard keyboard;
-  volatile int targetMidi=60; volatile boolean recording=false; AudioRecord recorder; Thread recordingThread;
+  volatile int targetMidi=60; volatile boolean recording=false; volatile AudioRecord recorder;
   final ArrayDeque<float[]> samples=new ArrayDeque<>(); long graphStart;
   final ExecutorService audioPool=Executors.newCachedThreadPool(); final ConcurrentHashMap<Integer,Tone> tones=new ConcurrentHashMap<>();
   int dp(float n){return (int)(getResources().getDisplayMetrics().density*n+.5f);} float hz(int midi){return (float)(440*Math.pow(2,(midi-69)/12.0));}
@@ -36,11 +36,129 @@ public class MainActivity extends Activity {
   void selectNote(int m){targetMidi=m;target.setText(note(m)+"  "+NOTES[Math.floorMod(m,12)]+"   ·   "+String.format(java.util.Locale.US,"%.1f Hz",hz(m)));if(keyboard!=null)keyboard.invalidate();if(graph!=null)graph.invalidate();}
   void toggleMic(){if(recording){stopMic();return;}if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},5);return;}startMic();}
   @Override public void onRequestPermissionsResult(int code,String[] permissions,int[] results){super.onRequestPermissionsResult(code,permissions,results);if(code==5&&results.length>0&&results[0]==PackageManager.PERMISSION_GRANTED)startMic();else status.setText("설정에서 마이크 권한을 허용해 주세요.");}
-  void startMic(){if(recording)return;try{int sr=22050;int size=Math.max(8192,AudioRecord.getMinBufferSize(sr,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT));recorder=new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION,sr,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,size);if(recorder.getState()!=AudioRecord.STATE_INITIALIZED)throw new IllegalStateException("마이크 초기화 실패");recorder.startRecording();recording=true;micButton.setText("■ 마이크 끄기");status.setText("목소리를 듣고 있어요");recordingThread=new Thread(()->{short[] buf=new short[4096];while(recording){int n=recorder.read(buf,0,buf.length);if(n<2048)continue;double f=detect(buf,n,sr);long time=SystemClock.elapsedRealtime();if(f>0){double midi=69+12*Math.log(f/440)/Math.log(2);int cents=(int)Math.round((midi-targetMidi)*100);synchronized(samples){samples.addLast(new float[]{time,(float)midi});trim(time);}runOnUiThread(()->{current.setText(note((int)Math.round(midi)));difference.setText(String.format(java.util.Locale.US,"%+d cent · %.1f Hz",cents,f));status.setText(Math.abs(cents)<=15?"✓ 정확한 음정이에요!":cents<0?"조금 더 높게 불러보세요 ↑":"조금 더 낮게 불러보세요 ↓");status.setTextColor(Math.abs(cents)<=15?Color.rgb(27,158,110):cents<0?BLUE:Color.rgb(218,89,105));graph.invalidate();});}else{ synchronized(samples){samples.addLast(new float[]{time,Float.NaN});trim(time);}runOnUiThread(()->{current.setText("—");difference.setText("차이 — cent");graph.invalidate();});}}},"pitch-analyzer");recordingThread.start();}catch(Exception e){recording=false;status.setText("마이크를 시작할 수 없어요: "+e.getMessage());}}
-  void trim(long now){while(!samples.isEmpty()&&now-samples.peekFirst()[0]>12000)samples.removeFirst();}
-  // Normalized difference function (YIN) with parabolic lag interpolation.
-  double detect(short[] data,int n,int sr){double rms=0;for(int i=0;i<n;i++){double x=data[i]/32768.0;rms+=x*x;}if(Math.sqrt(rms/n)<.012)return -1;int min=sr/1000,max=sr/75;double[] diff=new double[max+2];for(int lag=1;lag<=max;lag++){double sum=0;for(int j=0;j<n-max;j+=2){double d=(data[j]-data[j+lag])/32768.0;sum+=d*d;}diff[lag]=sum;}double running=0;int found=-1;for(int lag=1;lag<=max;lag++){running+=diff[lag];double cmnd=diff[lag]*lag/(running+1e-12);diff[lag]=cmnd;if(lag>=min&&cmnd<.16){while(lag+1<=max&&diff[lag+1]<diff[lag])lag++;found=lag;break;}}if(found<0)return -1;double a=diff[Math.max(1,found-1)],b=diff[found],c=diff[Math.min(max,found+1)];double offset=Math.max(-.5,Math.min(.5,.5*(a-c)/(a-2*b+c+1e-9)));return sr/(found+offset);}
-  void stopMic(){recording=false;micButton.setText("🎤 마이크 켜기");status.setText("마이크가 꺼졌어요");AudioRecord r=recorder;recorder=null;if(r!=null){try{r.stop();}catch(Exception ignored){}try{r.release();}catch(Exception ignored){}}}
+  void startMic() {
+    if (recording) return;
+    final int rate = 44100;
+    final int minBuffer = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO,
+        AudioFormat.ENCODING_PCM_16BIT);
+    AudioRecord input = null;
+    try {
+      if (minBuffer <= 0) throw new IllegalStateException();
+      input = new AudioRecord(MediaRecorder.AudioSource.MIC, rate,
+          AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuffer);
+      input.startRecording();
+      if (input.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
+        throw new IllegalStateException();
+      }
+    } catch (RuntimeException e) {
+      if (input != null) input.release();
+      status.setText("마이크를 시작할 수 없어요. 권한과 마이크 설정을 확인해 주세요.");
+      return;
+    }
+    final AudioRecord session = input;
+    recorder = session;
+    recording = true;
+    synchronized (samples) { samples.clear(); }
+    micButton.setText("■ 마이크 끄기");
+    status.setTextColor(MUTED);
+    status.setText("목소리를 듣고 있어요");
+    new Thread(() -> analyzeMic(session, rate), "pitch-analyzer").start();
+  }
+
+  void analyzeMic(AudioRecord input, int rate) {
+    final int hop = rate / 50;
+    short[] window = new short[hop * 2];
+    double[] differenceCurve = new double[rate / 65 + 1];
+    int filled = 0, quietFrames = 0;
+    try {
+      while (recorder == input) {
+        int count = input.read(window, filled, window.length - filled);
+        if (count < 0) throw new IllegalStateException();
+        filled += count;
+        if (filled < window.length) continue;
+        double frequency = detect(window, rate, differenceCurve);
+        System.arraycopy(window, hop, window, 0, hop);
+        filled = hop;
+        quietFrames = frequency > 0 ? 0 : quietFrames + 1;
+        if (quietFrames > 0 && quietFrames < 5) continue;
+        if (quietFrames > 5) continue;
+        double midi = frequency > 0 ? 69 + 12 * Math.log(frequency / 440) / Math.log(2) : Double.NaN;
+        long now = SystemClock.elapsedRealtime();
+        runOnUiThread(() -> {
+          if (recorder != input) return;
+          synchronized (samples) {
+            samples.addLast(new float[]{now, (float) midi});
+            while (!samples.isEmpty() && now - samples.peekFirst()[0] > 12000) samples.removeFirst();
+          }
+          if (frequency > 0) {
+            int cents = (int) Math.round((midi - targetMidi) * 100);
+            current.setText(note((int) Math.round(midi)));
+            difference.setText(String.format(Locale.US, "%+d cent · %.1f Hz", cents, frequency));
+            status.setText(Math.abs(cents) <= 15 ? "✓ 정확한 음정이에요!"
+                : cents < 0 ? "조금 더 높게 불러보세요 ↑" : "조금 더 낮게 불러보세요 ↓");
+            status.setTextColor(Math.abs(cents) <= 15 ? Color.rgb(27,158,110)
+                : cents < 0 ? BLUE : Color.rgb(218,89,105));
+          } else {
+            current.setText("—");
+            difference.setText("차이 — cent");
+            status.setTextColor(MUTED);
+            status.setText("목소리를 듣고 있어요");
+          }
+          graph.invalidate();
+        });
+      }
+    } catch (RuntimeException e) {
+      runOnUiThread(() -> {
+        if (recorder != input) return;
+        stopMic();
+        status.setText("마이크 입력이 끊겼어요. 다시 켜 주세요.");
+      });
+    } finally {
+      input.release();
+    }
+  }
+
+  double detect(short[] window, int rate, double[] curve) {
+    double power = 0;
+    for (short sample : window) power += (double) sample * sample;
+    if (power < window.length * 80.0 * 80.0) return -1;
+
+    int maxLag = curve.length - 1;
+    double cumulative = 0;
+    curve[0] = 1;
+    for (int lag = 1; lag <= maxLag; lag++) {
+      double sum = 0;
+      for (int i = 0; i < window.length - maxLag; i += 2) {
+        int delta = window[i] - window[i + lag];
+        sum += (double) delta * delta;
+      }
+      cumulative += sum;
+      curve[lag] = cumulative > 0 ? sum * lag / cumulative : 1;
+    }
+    for (int lag = rate / 1200; lag < maxLag; lag++) {
+      if (curve[lag] >= .18) continue;
+      while (lag < maxLag && curve[lag + 1] < curve[lag]) lag++;
+      if (lag == maxLag) return (double) rate / lag;
+      double a = curve[lag - 1], b = curve[lag], c = curve[lag + 1];
+      double offset = Math.max(-.5, Math.min(.5, .5 * (a - c) / (a - 2*b + c + 1e-9)));
+      return rate / (lag + offset);
+    }
+    return -1;
+  }
+
+  void stopMic() {
+    AudioRecord input = recorder;
+    recorder = null;
+    recording = false;
+    if (input != null) {
+      try { input.stop(); } catch (IllegalStateException ignored) {}
+    }
+    micButton.setText("🎤 마이크 켜기");
+    current.setText("—");
+    difference.setText("차이 — cent");
+    status.setTextColor(MUTED);
+    status.setText("마이크가 꺼졌어요");
+  }
   void startTone(int pointer,int midi){stopTone(pointer);Tone tone=new Tone(midi);tones.put(pointer,tone);audioPool.execute(tone);}
   void stopTone(int pointer){Tone t=tones.remove(pointer);if(t!=null)t.running=false;}
   class Tone implements Runnable {volatile boolean running=true;final int midi;Tone(int m){midi=m;}public void run(){int sr=22050;AudioTrack track=null;try{int buffer=Math.max(4096,AudioTrack.getMinBufferSize(sr,AudioFormat.CHANNEL_OUT_MONO,AudioFormat.ENCODING_PCM_16BIT));track=new AudioTrack(AudioManager.STREAM_MUSIC,sr,AudioFormat.CHANNEL_OUT_MONO,AudioFormat.ENCODING_PCM_16BIT,buffer,AudioTrack.MODE_STREAM);track.play();short[] wave=new short[1024];double phase=0,step=2*Math.PI*hz(midi)/sr;long index=0;while(running){for(int i=0;i<wave.length;i++){double env=Math.min(1,(index++)/(sr*.02));double s=Math.sin(phase)+.22*Math.sin(phase*2)+.08*Math.sin(phase*3);wave[i]=(short)(s*env*6500);phase+=step;if(phase>Math.PI*2)phase-=Math.PI*2;}track.write(wave,0,wave.length);}Arrays.fill(wave,(short)0);track.write(wave,0,wave.length);}catch(Exception ignored){}finally{if(track!=null){try{track.stop();}catch(Exception ignored){}track.release();}}}}
